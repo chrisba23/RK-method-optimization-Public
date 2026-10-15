@@ -1,0 +1,631 @@
+thisFile = matlab.desktop.editor.getActiveFilename;
+baseDir = fileparts(thisFile);
+cd(baseDir);
+addpath(genpath(fullfile(baseDir,'..','..','..','..','..','Extern-Repos','RK-Opt-add_2N_fixed')));
+
+repoDir = fullfile(baseDir,'..','..','..','..','..','Extern-Repos','RK-Opt-add_2N_fixed');
+addpath(genpath(repoDir),'-begin');
+clear functions
+
+%% Optimization for the Two-scale test spectrum
+
+
+% Define the slow and fast eigenvalues of the two-scale test problem
+alpha = 1;
+epsi  = 1e-3;
+
+lam1 = -alpha;
+lam2 = -1/epsi;
+
+% Build two circular clusters around the slow and fast eigenvalues
+kappa = 0.05;           
+r1 = kappa*abs(lam1);
+r2 = kappa*abs(lam2);
+
+M = 300;                
+theta = linspace(0, 2*pi, M);
+
+D1 = lam1 + r1*cos(theta) + 1i*r1*sin(theta);
+D2 = lam2 + r2*cos(theta) + 1i*r2*sin(theta);
+S  = [D1, D2];
+
+% Choose the order and the number of stages
+p = 4;
+s = 10;
+
+
+% Compute the optimized stability polynomial using Chebyshev interpolation
+[h_star, R_vals] = opt_poly_bisect(S, s, p, 'chebinterp');
+fprintf('p=%d, s=%d:  h* = %.6g', p, s, h_star);
+
+% Reconstruct the Chebyshev interpolation nodes used for the PolyOpt polynomial
+z      = h_star * S;
+zmin   = min(real(z));
+zmax   = 0;
+N      = s;
+j      = 0:N;
+x_cheb = cos(pi*j/N);
+z_nodes_full = 0.5*((zmax+zmin) + (zmax - zmin)*x_cheb);
+z_nodes_full = z_nodes_full(:);   % (s+1) x 1
+R_vals_full = R_vals(:);         
+
+% Use only a small number of interpolation conditions in RK-Opt.
+% This makes the low-storage optimization easier to solve.            
+K = s-p; 
+
+
+% Select the interpolation nodes closest to the fast cluster.
+z_fast_center = h_star * lam2;
+[~, sort_idx] = sort(abs(z_nodes_full - z_fast_center));
+idx      = sort_idx(1:K);
+idx      = sort(idx);
+z_nodes  = z_nodes_full(idx);
+R_vals_K = R_vals_full(idx);
+
+
+
+R_eval = bary_eval_cheb(z_nodes_full, R_vals_full, h_star*S);
+mx = max(abs(R_eval));
+fprintf(',   max |R(h*lambda)| = %.3e\n', mx);
+
+
+% RK-optimization
+rk = rk_opt(s, p, '3Sstar', 'acc', ...
+    'interp_nodes',  z_nodes, ...
+    'interp_values', R_vals_K, ...
+    'algorithm','interior-point', ...
+    'num_starting_points', 300, ...
+    'write_to_file', 1, ...
+    'append_time', 1, ...
+    'suppress_warnings', true);
+
+
+function p = bary_eval_cheb(z_nodes, f_nodes, z_eval)
+z_nodes = z_nodes(:);
+f_nodes = f_nodes(:);
+z_eval  = z_eval(:);
+
+N = length(z_nodes) - 1;
+
+w = ones(N+1,1);
+w(1)   = 0.5;
+w(end) = 0.5;
+w = w .* (-1).^(0:N)';
+
+p = zeros(size(z_eval));
+
+for k = 1:length(z_eval)
+    zk = z_eval(k);
+
+    idx = find(abs(zk - z_nodes) < 1e-14, 1);
+    if ~isempty(idx)
+        p(k) = f_nodes(idx);
+    else
+        temp = w ./ (zk - z_nodes);
+        p(k) = sum(temp .* f_nodes) / sum(temp);
+    end
+end
+end
+
+
+
+% Check the RK stability function on the two eigenvalues and on the full spectrum.
+ function check_two_scale_stability(rk, h, alpha, epsi, S)
+    A = rk.A;
+    b = rk.b(:);
+    s = numel(b);
+    e = ones(s,1);
+    I = eye(s);
+
+    lam1 = -alpha;
+    lam2 = -1/epsi;
+
+    z_lam = h * [lam1; lam2];
+    z_S   = h * S(:);
+
+    z_all = [z_lam; z_S];
+    R_all = zeros(size(z_all));
+
+    % Evaluate the stability function
+    % R(z) = 1 + z b^T (I - zA)^{-1} e.
+    for j = 1:numel(z_all)
+        z = z_all(j);
+        Y = (I - z*A)\e;          
+        R_all(j) = 1 + z*(b.'*Y); 
+    end
+
+    R_lam = R_all(1:2);
+    R_S   = R_all(3:end);
+
+    fprintf('h = %.6g\n', h);
+    fprintf('lambda1 = %g: R = %g (|R| = %.6f)\n', lam1, R_lam(1), abs(R_lam(1)));
+    fprintf('lambda2 = %g: R = %g (|R| = %.6f)\n', lam2, R_lam(2), abs(R_lam(2)));
+    fprintf('max |R_RK(h*lambda)| over S: %.6f\n', max(abs(R_S)));
+end
+
+
+dt = h_star;
+check_two_scale_stability(rk, dt, alpha, epsi, S);
+
+
+
+dataDir = fullfile(baseDir, 'polyopt_data');
+if ~exist(dataDir, 'dir')
+    mkdir(dataDir);
+end
+
+method_type = '3Sstar'; 
+basis = 'chebinterp';
+
+files = dir(fullfile(baseDir, sprintf('%s-%d-%d_*.txt', method_type, p, s)));
+
+[~, idxNewest] = max([files.datenum]);
+methodName = files(idxNewest).name;
+
+[~, baseName, ~] = fileparts(methodName);
+dataFile = fullfile(dataDir, [baseName '_plot_data.mat']);
+
+experiment = struct();
+
+experiment.method_file = methodName;
+experiment.method_type = method_type;
+experiment.basis = basis;
+
+experiment.h_star = h_star;
+experiment.M = M;
+experiment.S = S(:);
+
+experiment.z_nodes_full = z_nodes_full;
+experiment.R_vals_full = R_vals_full;
+
+save(dataFile, 'experiment');
+
+fprintf('Saved plot data file:\n%s\n', dataFile);
+
+%% Plot near the slow and fast clusters
+% Compare the RK stability region with the PolyOpt boundary near both clusters.
+A = rk.A;
+b = rk.b(:);
+
+M = 300;
+theta = linspace(0, 2*pi, M);
+
+zSlow = h_star * (lam1 + r1*cos(theta) + 1i*r1*sin(theta));
+zFast = h_star * (lam2 + r2*cos(theta) + 1i*r2*sin(theta));
+
+clusters = {zSlow, zFast};
+centers  = [h_star*lam1, h_star*lam2];
+
+rads = [30*h_star*r1, 1.3*h_star*r2];
+titles = {'Slow cluster', 'Fast cluster'};
+
+figure;
+t = tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+
+for j = 1:2
+    z_spec = clusters{j};
+    z0     = centers(j);
+    rad    = rads(j);
+
+    z_plot = z_spec(1:12:end);
+
+    n = 600;
+    x = linspace(real(z0)-rad, real(z0)+rad, n);
+    y = linspace(imag(z0)-rad, imag(z0)+rad, n);
+    [XX,YY] = meshgrid(x,y);
+    Z = XX + 1i*YY;
+
+    % Evaluate the RK method and the PolyOpt reference polynomial.
+    R_rk = R_by_butcher(A, b, Z);
+    R_poly = reshape(bary_eval_cheb(z_nodes_full, R_vals_full, Z(:)), size(Z));
+
+    nexttile;
+    hold on; axis equal; grid on;
+
+    contourf(XX,YY, abs(R_rk)<=1, [1 1], 'LineStyle','none');
+    contour(XX,YY, abs(R_poly), [1 1], 'k', 'LineWidth', 2);
+
+    plot(real(z_plot), imag(z_plot), 'ro', ...
+        'MarkerSize', 4, 'MarkerFaceColor', 'r');
+
+    plot(real(z0), imag(z0), 'bo', ...
+        'MarkerSize', 6, 'MarkerFaceColor', 'b');
+
+    xlim([real(z0)-rad, real(z0)+rad]);
+    ylim([imag(z0)-rad, imag(z0)+rad]);
+
+    xlabel('Re(z)');
+    ylabel('Im(z)');
+    title(titles{j});
+end
+
+% Single legend for the whole tiled layout
+ax = gca;
+hold(ax, 'on');
+hFill = patch(ax, NaN, NaN, [0.75 0.9 0.9], 'EdgeColor', 'none');
+hPoly = plot(ax, NaN, NaN, 'k', 'LineWidth', 2);
+hSpec = plot(ax, NaN, NaN, 'ro', 'MarkerFaceColor', 'r', 'MarkerSize', 4);
+hCent = plot(ax, NaN, NaN, 'bo', 'MarkerFaceColor', 'b', 'MarkerSize', 6);
+
+lgd = legend(ax, [hFill, hPoly, hSpec, hCent], ...
+    {'RK stable region','PolyOpt boundary','Scaled spectrum','Center'});
+lgd.Layout.Tile = 'east';
+
+if ~exist(plotDir, 'dir')
+    mkdir(plotDir);
+end
+
+plotFile = fullfile(plotDir, sprintf('3Sstar_p%d_s%d_chebinterp_plot.png', p, s));
+drawnow;
+frame = getframe(gcf);
+imwrite(frame.cdata, plotFile);
+
+coeffFile = fullfile(plotDir, sprintf('3Sstar_p%d_s%d_chebinterp_data.txt', p, s));
+fid = fopen(coeffFile, 'w');
+if fid == -1
+    error('Could not open file: %s', coeffFile);
+end
+
+fprintf(fid, 'PolyOpt reference\n');
+fprintf(fid, 'z_nodes_full\n');
+fprintf(fid, '%.16g\n', real(z_nodes_full(:)));
+
+fprintf(fid, '\nR_vals_full\n');
+fprintf(fid, '%.16g\n', real(R_vals_full(:)));
+
+fprintf(fid, '\nData used in rk_opt\n');
+fprintf(fid, 'z_nodes\n');
+fprintf(fid, '%.16g\n', real(z_nodes(:)));
+
+fprintf(fid, '\nR_vals_K\n');
+fprintf(fid, '%.16g\n', real(R_vals_K(:)));
+
+fclose(fid);
+
+
+
+%% Compare different stability function evaluations
+
+% Compare the stability function from the 3S* implementation, the Butcher form,
+% and the polynomial coefficients.
+A = rk.A;
+b = rk.b(:);
+
+
+beta_mat = rk.beta;
+gamma1   = rk.gamma1;
+gamma2   = rk.gamma2;
+gamma3   = rk.gamma3;
+delta    = rk.delta;
+
+beta_ls = diag(beta_mat,-1);
+beta_ls = beta_ls(:);
+g1 = gamma1(:);
+g2 = gamma2(:);
+g3 = gamma3(:);
+delta_ls = delta(:);
+
+rad = 1.5 * h_star * r2;
+z0  = h_star * lam2;
+
+M = 300;
+theta = linspace(0, 2*pi, M);
+
+D2 = lam2 + r2*cos(theta) + 1i*r2*sin(theta);
+z_circle = h_star * D2(:);
+
+
+spec_step = 12;
+z_spec = z_circle(1:spec_step:end);
+
+n = 700;
+x = linspace(real(z0)-rad, real(z0)+rad, n);
+y = linspace(imag(z0)-rad, imag(z0)+rad, n);
+[XX,YY] = meshgrid(x,y);
+Z = XX + 1i*YY;
+
+% Evaluate the stability function in three different ways.
+R_3Sstar  = R_by_one_step_3Sstar_vec(beta_ls, g1, g2, g3, delta_ls, Z);
+R_butcher = R_by_butcher(A, b, Z);
+a_pow     = stability_poly_coeffs_from_butcher(A, b);
+R_pow     = polyval(flipud(a_pow), Z);
+% Evaluate the PolyOpt reference polynomial.
+R_poly_vec = bary_eval_cheb(z_nodes_full, R_vals_full, Z(:));
+R_poly = reshape(R_poly_vec, size(Z));
+
+figure;
+tiledlayout(1,3,'Padding','compact','TileSpacing','compact');
+
+nexttile;
+plot_stability_panel(XX, YY, R_3Sstar, R_poly, z_spec, z0, rad, ...
+    'Low-storage (3S*)', false);
+
+nexttile;
+plot_stability_panel(XX, YY, R_butcher, R_poly, z_spec, z0, rad, ...
+    'R(z)=1+zb^T(I-zA)^{-1}1', false);
+
+nexttile;
+plot_stability_panel(XX, YY, R_pow, R_poly, z_spec, z0, rad, ...
+    'R(z)=1+\Sigma z^k b^T A^{k-1}1', true);
+
+if ~exist(plotDir, 'dir')
+    mkdir(plotDir);
+end
+
+plotFile = fullfile(plotDir, sprintf('3Sstar_p%d_s%d_chebinterp_compare3.png', p, s));
+drawnow;
+frame = getframe(gcf);
+imwrite(frame.cdata, plotFile);
+
+
+function plot_stability_panel(XX, YY, R_panel, R_poly, z_spec, z0, rad, panelTitle, showLegend)
+hold on; axis equal; grid on;
+
+% RK stable region as filled surface
+contourf(XX,YY, abs(R_panel)<=1, [1 1], 'LineStyle','none');
+
+% PolyOpt as black line
+contour(XX,YY, abs(R_poly), [1 1], 'k', 'LineWidth', 2);
+
+% scaled spectrum as red points
+hSpec = plot(real(z_spec), imag(z_spec), 'ro', ...
+    'MarkerSize', 4, 'LineWidth', 1, 'MarkerFaceColor', 'r');
+
+% mark the sacaled fast eigenvalues
+hCenter = plot(real(z0), imag(z0), 'o', ...
+    'MarkerSize', 6, ...
+    'LineWidth', 1.2, ...
+    'MarkerEdgeColor', [0 0.2 0.7], ...
+    'MarkerFaceColor', [0 0.2 0.7]);
+
+xlim([real(z0)-rad, real(z0)+rad]);
+ylim([imag(z0)-rad, imag(z0)+rad]);
+set(gca,'XLimMode','manual','YLimMode','manual');
+
+xlabel('Re(z)');
+ylabel('Im(z)');
+title(panelTitle);
+
+if showLegend
+    hFill = patch(NaN,NaN,[0.15 0.75 0.75], 'EdgeColor','none');
+    hPoly = plot(NaN,NaN,'k','LineWidth',2);
+
+    lgd = legend([hFill,hPoly,hSpec,hCenter], ...
+        {'RK region', 'PolyOpt', 'Spectrum', 'Fast eigenvalue'}, ...
+        'Location','eastoutside');
+    lgd.FontSize = 8;
+end
+end
+
+
+function coeffs = stability_poly_coeffs_from_butcher(A, b)
+b = b(:);
+s = length(b);
+e = ones(s,1);
+
+coeffs = zeros(s+1,1);
+coeffs(1) = 1;
+
+v = e;
+for j = 1:s
+    coeffs(j+1) = b.' * v;
+    v = A * v;
+end
+end
+
+
+
+function R = R_by_butcher(A, b, Z)
+s = length(b);
+e = ones(s,1);
+I = eye(s);
+
+R = zeros(size(Z));
+for k = 1:numel(Z)
+    z = Z(k);
+    Y = (I - z*A) \ e;
+    R(k) = 1 + z * (b.' * Y);
+end
+R = reshape(R, size(Z));
+end
+
+
+function R = R_by_one_step_3Sstar_vec(beta, g1, g2, g3, delta, Z)
+m = numel(delta);
+
+S3 = ones(size(Z));
+S1 = ones(size(Z));
+S2 = zeros(size(Z));
+
+for i = 2:(m+1)
+    S2 = S2 + delta(i-1).*S1;
+    S1 = g1(i).*S1 + g2(i).*S2 + g3(i).*S3 + beta(i-1).*(Z.*S1);
+end
+
+R = S1;
+end
+
+
+%% Pseudocolor plot of one stability function
+% Plot the absolute value of one selected stability function near the fast cluster
+
+A = rk.A;
+b = rk.b(:);
+
+beta_mat = rk.beta;
+gamma1   = rk.gamma1;
+gamma2   = rk.gamma2;
+gamma3   = rk.gamma3;
+delta    = rk.delta;
+
+beta_ls = diag(beta_mat,-1);
+beta_ls = beta_ls(:);
+g1 = gamma1(:);
+g2 = gamma2(:);
+g3 = gamma3(:);
+delta_ls = delta(:);
+
+rad = 1.5 * h_star * r2;
+z0  = h_star * lam2;
+
+theta = linspace(0,2*pi,300);
+D2 = lam2 + r2*cos(theta) + 1i*r2*sin(theta);
+z_circle = h_star * D2(:);
+z_spec = z_circle(1:12:end);
+
+x = linspace(real(z0)-rad, real(z0)+rad, 600);
+y = linspace(imag(z0)-rad, imag(z0)+rad, 600);
+[XX,YY] = meshgrid(x,y);
+Z = XX + 1i*YY;
+
+R_3Sstar  = R_by_one_step_3Sstar_vec(beta_ls, g1, g2, g3, delta_ls, Z);
+R_butcher = R_by_butcher(A, b, Z);
+a_pow     = stability_poly_coeffs_from_butcher(A, b);
+R_pow     = polyval(flipud(a_pow), Z);
+
+% Select which representation should be plotted.
+plotMode = 'powers';
+
+switch plotMode
+    case 'powers'
+        R_sel = R_pow;
+        plotTitle = 'R(z)=1+\Sigma z^k b^T A^{k-1}1';
+        fileTag = 'powers';
+
+    case 'butcher'
+        R_sel = R_butcher;
+        plotTitle = 'R(z)=1+zb^T(I-zA)^{-1}1';
+        fileTag = 'butcher';
+
+    case '3Sstar'
+        R_sel = R_3Sstar;
+        plotTitle = 'Low-storage (3S*)';
+        fileTag = '3Sstar';
+end
+
+V = abs(R_sel);
+Vplot = min(V,1.25);
+
+figure;
+hold on; axis equal; grid on;
+
+levels = [0 0.25 0.5 0.75 1.0 1.25];
+contourf(XX,YY,Vplot,levels,'LineStyle','none');
+
+colormap([
+    0.23 0.20 0.75
+    0.28 0.53 0.88
+    0.28 0.78 0.68
+    0.95 0.90 0.20
+    0.92 0.10 0.10
+    ]);
+
+caxis([0 1.25]);
+
+cb = colorbar;
+ylabel(cb,'|R(z)|');
+cb.Ticks = [0 0.25 0.5 0.75 1 1.25];
+cb.TickLabels = {'0','0.25','0.5','0.75','1','>1'};
+
+contour(XX,YY,V,[1 1],'k','LineWidth',2);
+
+plot(real(z_spec),imag(z_spec),'ko', ...
+    'MarkerSize',4,'MarkerFaceColor','k','LineStyle','none');
+
+xlim([real(z0)-rad, real(z0)+rad]);
+ylim([imag(z0)-rad, imag(z0)+rad]);
+
+xlabel('Re(z)');
+ylabel('Im(z)');
+title(plotTitle);
+
+legend('|R(z)| = 1','Scaled spectrum','Location','northeast');
+
+if ~exist(plotDir,'dir')
+    mkdir(plotDir);
+end
+
+plotFile = fullfile(plotDir, sprintf('pseudocolor_%s_p%d_s%d_chebinterp.png', fileTag, p, s));
+drawnow;
+frame = getframe(gcf);
+imwrite(frame.cdata, plotFile);
+
+
+%% Pseudocolor zoomed out and more levels
+A = rk.A;
+b = rk.b(:);
+
+beta_mat = rk.beta;
+gamma1   = rk.gamma1;
+gamma2   = rk.gamma2;
+gamma3   = rk.gamma3;
+delta    = rk.delta;
+
+beta_ls = diag(beta_mat,-1);
+beta_ls = beta_ls(:);
+g1 = gamma1(:);
+g2 = gamma2(:);
+g3 = gamma3(:);
+delta_ls = delta(:);
+
+rad = 2 * h_star * r2;
+z0  = h_star * lam2;
+
+theta = linspace(0,2*pi,300);
+D2 = lam2 + r2*cos(theta) + 1i*r2*sin(theta);
+z_circle = h_star * D2(:);
+z_spec = z_circle(1:12:end);
+
+n = 700;
+x = linspace(real(z0)-rad, real(z0)+rad, n);
+y = linspace(imag(z0)-rad, imag(z0)+rad, n);
+[XX,YY] = meshgrid(x,y);
+Z = XX + 1i*YY;
+
+R_3Sstar  = R_by_one_step_3Sstar_vec(beta_ls, g1, g2, g3, delta_ls, Z);
+R_butcher = R_by_butcher(A, b, Z);
+a_pow     = stability_poly_coeffs_from_butcher(A, b);
+R_pow     = polyval(flipud(a_pow), Z);
+
+plotMode = '3Sstar';
+
+switch plotMode
+    case 'powers'
+        R_sel = R_pow;
+        plotTitle = 'R(z)=1+\Sigma z^k b^T A^{k-1}1';
+        fileTag = 'powers';
+
+    case 'butcher'
+        R_sel = R_butcher;
+        plotTitle = 'R(z)=1+zb^T(I-zA)^{-1}1';
+        fileTag = 'butcher';
+
+    case '3Sstar'
+        R_sel = R_3Sstar;
+        plotTitle = 'Low-storage (3S*)';
+        fileTag = '3Sstar';
+end
+
+V = abs(R_sel);
+
+figure;
+hold on; axis equal; grid on;
+
+levels = [0 0.25 0.5 0.75 1 2 5 10];
+contourf(XX,YY,min(V,50),levels,'LineStyle','none');
+contour(XX,YY,V,[1 1],'k','LineWidth',2);
+
+plot(real(z_spec),imag(z_spec),'ko', ...
+    'MarkerSize',4,'MarkerFaceColor','k','LineStyle','none');
+
+xlabel('Re(z)');
+ylabel('Im(z)');
+title(['Overview: ', plotTitle]);
+
+cb = colorbar;
+ylabel(cb,'|R(z)|');
+
+plotFile = fullfile(plotDir, sprintf('pseudocolor_%s_p%d_s%d_chebinterp.png', fileTag, p, s));
+drawnow;
+frame = getframe(gcf);
+imwrite(frame.cdata, plotFile);
